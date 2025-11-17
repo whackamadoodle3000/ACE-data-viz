@@ -1,61 +1,60 @@
 #!/usr/bin/env python3
 
 """
-Generate detailed comparison plots between the baseline and ACE evaluation runs.
+Generate BFCL comparison plots across multiple ACE configurations.
 
-This script reads the CSV summaries stored under `score_baseline_all` and
-`score_playbook_all`, cleans and aligns the numeric metrics, and produces a
-series of Matplotlib visualizations that highlight how the ACE configuration
-performs relative to the baseline on the same dataset.
+The script aligns the CSV summaries produced for:
+  • Baseline (`score_baseline_all`)
+  • ACE w/o Claude (`score_playbook_all`)
+  • ACE w/ Claude (`score_ace_claude_run`)
+  • Dynamic ACE w/ Claude (`results_sai/score_ace_claude_run`)
+  • Dynamic ACE w/o Claude (`results_sai/score_ace_eval_run`)
 
-Web-search related metrics are intentionally excluded to keep the focus on the
-core task-oriented capabilities.
+Web-search related columns are ignored so the visuals focus on execution,
+reasoning, and hallucination signals.
 """
 
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple, Callable
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 BASE_DIR = Path(__file__).resolve().parent
-BASELINE_DIR = BASE_DIR / "score_baseline_all"
-ACE_DIR = BASE_DIR / "score_playbook_all"
 OUTPUT_DIR = BASE_DIR / "plots"
 
-BASELINE_COLOR = "#1f77b4"
-ACE_COLOR = "#ff7f0e"
+RUN_SPECS: Sequence[Tuple[str, Path]] = [
+    ("Baseline", BASE_DIR / "score_baseline_all"),
+    ("ACE w/o Claude", BASE_DIR / "score_playbook_all"),
+    ("ACE w/ Claude", BASE_DIR / "score_ace_claude_run"),
+    ("Dynamic ACE w/ Claude", BASE_DIR / "results_sai" / "score_ace_claude_run"),
+    ("Dynamic ACE w/o Claude", BASE_DIR / "results_sai" / "score_ace_eval_run"),
+]
 
 
-def normalize_value(value) -> float | str:
-    """Convert percentage strings and 'N/A' markers into numeric floats."""
+def normalize_value(value) -> float:
     if pd.isna(value):
         return np.nan
     if isinstance(value, (int, float)):
         return float(value)
     if not isinstance(value, str):
-        return value
+        return np.nan
 
     stripped = value.strip()
     if stripped == "" or stripped.upper() == "N/A":
         return np.nan
     if stripped.endswith("%"):
         stripped = stripped[:-1]
-        if stripped == "":
-            return np.nan
-        try:
-            return float(stripped)
-        except ValueError:
-            return np.nan
     try:
         return float(stripped)
     except ValueError:
-        return stripped
+        return np.nan
 
 
 def read_single_row_csv(path: Path) -> pd.Series:
@@ -78,17 +77,31 @@ def format_value(value: float, unit: str) -> str:
     return f"{value:.2f}"
 
 
-def delta_label(delta: float, unit: str) -> str:
-    if delta is None or pd.isna(delta):
-        return "ACE − Baseline: N/A"
-    suffix = " pp" if unit == "percent" else ""
-    return f"ACE − Baseline: {delta:+.2f}{suffix}"
+def compute_composite_without_web(overall: pd.Series) -> float:
+    components = [
+        overall.get("Non-Live AST Acc", np.nan),
+        overall.get("Live Acc", np.nan),
+        overall.get("Multi Turn Acc", np.nan),
+    ]
+    finite = [val for val in components if np.isfinite(val)]
+    if not finite:
+        return np.nan
+    return float(np.mean(finite))
+
+
+def build_palette(run_names: Sequence[str]) -> Dict[str, Tuple[float, float, float, float]]:
+    cmap = plt.get_cmap("tab10")
+    colors = {}
+    for idx, name in enumerate(run_names):
+        colors[name] = cmap(idx % cmap.N)
+    return colors
 
 
 def configure_percent_axis(ax, data: Sequence[float]) -> None:
     finite_values = [val for val in data if np.isfinite(val)]
     if not finite_values:
         ax.set_ylim(0, 1)
+        ax.set_ylabel("Score (%)")
         return
     ymax = max(finite_values)
     upper = max(100.0, ymax * 1.15)
@@ -108,741 +121,538 @@ def configure_value_axis(ax, data: Sequence[float], label: str) -> None:
     ax.set_ylabel(label)
 
 
-def annotate_bars(ax, bars: Iterable[plt.Rectangle], unit: str) -> None:
-    for bar in bars:
+def build_bar_labels(
+    values: Sequence[float],
+    baseline_values: Sequence[float],
+    unit: str,
+) -> List[str]:
+    labels: List[str] = []
+    for idx, (value, baseline_val) in enumerate(zip(values, baseline_values)):
+        if not np.isfinite(value):
+            labels.append("N/A")
+            continue
+        text = format_value(value, unit)
+        if idx > 0 and np.isfinite(baseline_val):
+            delta = value - baseline_val
+            if not math.isclose(delta, 0.0, abs_tol=1e-9):
+                suffix = " pp" if unit == "percent" else ""
+                text = f"{text}\n({delta:+.2f}{suffix})"
+        labels.append(text)
+    return labels
+
+
+def annotate_bars(ax, bars: Iterable[plt.Rectangle], labels: Sequence[str]) -> None:
+    if not labels:
+        return
+    ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1.0
+    for bar, label in zip(bars, labels):
+        if not label:
+            continue
         height = bar.get_height()
-        if math.isnan(height):
-            label = "N/A"
-            height = 0
-        else:
-            label = format_value(height, unit)
+        if not np.isfinite(height):
+            height = 0.0
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            height + (0.02 * ax.get_ylim()[1]),
+            height + 0.02 * ymax,
             label,
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=8,
         )
 
 
-def compute_composite_without_web(overall: pd.Series) -> float:
-    components = [
-        overall.get("Non-Live AST Acc", np.nan),
-        overall.get("Live Acc", np.nan),
-        overall.get("Multi Turn Acc", np.nan),
-    ]
-    finite = [val for val in components if np.isfinite(val)]
-    if not finite:
-        return np.nan
-    return float(np.mean(finite))
+def load_run_data() -> OrderedDict[str, Dict[str, pd.Series]]:
+    run_data: OrderedDict[str, Dict[str, pd.Series]] = OrderedDict()
+    for run_name, run_path in RUN_SPECS:
+        required_files = {
+            "overall": run_path / "data_overall.csv",
+            "non_live": run_path / "data_non_live.csv",
+            "live": run_path / "data_live.csv",
+            "multi": run_path / "data_multi_turn.csv",
+        }
+        for file_path in required_files.values():
+            if not file_path.exists():
+                raise FileNotFoundError(f"Missing expected file: {file_path}")
+
+        overall = read_single_row_csv(required_files["overall"])
+        overall["Composite Acc (No Web)"] = compute_composite_without_web(overall)
+        run_data[run_name] = {
+            "overall": overall,
+            "non_live": read_single_row_csv(required_files["non_live"]),
+            "live": read_single_row_csv(required_files["live"]),
+            "multi": read_single_row_csv(required_files["multi"]),
+        }
+
+    return run_data
 
 
-def plot_single_metric(
+def plot_metric_panel(
     ax: plt.Axes,
-    label: str,
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    dataset_key: str,
     column: str,
+    title: str,
     unit: str,
-    baseline: pd.Series,
-    ace: pd.Series,
+    colors: Mapping[str, Tuple[float, float, float, float]],
 ) -> None:
-    baseline_val = baseline[column]
-    ace_val = ace[column]
-    values = [baseline_val, ace_val]
+    run_names = list(run_data.keys())
+    values = [run_data[name][dataset_key].get(column, np.nan) for name in run_names]
+    heights = [val if np.isfinite(val) else 0.0 for val in values]
+
+    x = np.arange(len(run_names))
+    bars = ax.bar(
+        x,
+        heights,
+        color=[colors[name] for name in run_names],
+        width=0.6,
+    )
 
     if unit == "percent":
         configure_percent_axis(ax, values)
     else:
-        configure_value_axis(ax, values, label)
+        configure_value_axis(ax, values, title)
 
-    bars = ax.bar(
-        [0, 1],
-        values,
-        color=[BASELINE_COLOR, ACE_COLOR],
-        width=0.6,
-    )
-    ax.set_xticks([0, 1], ["Baseline", "ACE"])
-    ax.set_title(label, fontweight="semibold")
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    annotate_bars(ax, bars, unit)
-
-    if np.isfinite(baseline_val) and np.isfinite(ace_val):
-        delta = ace_val - baseline_val
-        ax.text(
-            0.5,
-            ax.get_ylim()[1] * 0.92,
-            delta_label(delta, unit),
-            ha="center",
-            va="top",
-            fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85),
-        )
-
-
-def plot_grouped_metrics(
-    ax: plt.Axes,
-    metrics: Sequence[Tuple[str, str, str]],
-    baseline: pd.Series,
-    ace: pd.Series,
-    title: str,
-) -> None:
-    labels: List[str] = []
-    baseline_vals: List[float] = []
-    ace_vals: List[float] = []
-
-    for display, column, unit in metrics:
-        base_val = baseline.get(column, np.nan)
-        ace_val = ace.get(column, np.nan)
-        if (not np.isfinite(base_val)) and (not np.isfinite(ace_val)):
-            continue
-        labels.append(display)
-        baseline_vals.append(base_val)
-        ace_vals.append(ace_val)
-
-    if not labels:
-        ax.text(0.5, 0.5, "No comparable metrics available.", ha="center", va="center")
-        ax.set_axis_off()
-        return
-
-    unit = metrics[0][2]
-    x = np.arange(len(labels))
-    width = 0.35
-
-    bars_baseline = ax.bar(
-        x - width / 2,
-        baseline_vals,
-        width,
-        label="Baseline",
-        color=BASELINE_COLOR,
-    )
-    bars_ace = ax.bar(
-        x + width / 2,
-        ace_vals,
-        width,
-        label="ACE",
-        color=ACE_COLOR,
-    )
-
-    if unit == "percent":
-        configure_percent_axis(ax, baseline_vals + ace_vals)
-    else:
-        configure_value_axis(ax, baseline_vals + ace_vals, title)
+    baseline_values = [values[0]] * len(values)
+    labels = build_bar_labels(values, baseline_values, unit)
+    annotate_bars(ax, bars, labels)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_xticklabels(run_names, rotation=20, ha="right")
     ax.set_title(title, fontweight="semibold")
+    ax.grid(axis="y", linestyle="--", alpha=0.35)
+
+
+def render_metric_groups(
+    filename: str,
+    title: str,
+    grouped_metrics: Sequence[Tuple[str, str, Sequence[Tuple[str, str]]]],
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+    unit: str = "percent",
+    rotation: int = 25,
+    figsize: Tuple[float, float] = (16, 6),
+    ylabel: str | None = None,
+) -> None:
+    run_names = list(run_data.keys())
+    if not run_names:
+        return
+
+    prepared_groups: List[Tuple[str, List[Tuple[str, List[float]]]]] = []
+    for group_label, dataset_key, metrics in grouped_metrics:
+        group_metrics: List[Tuple[str, List[float]]] = []
+        for metric_label, column in metrics:
+            metric_values = [
+                run_data[name][dataset_key].get(column, np.nan) for name in run_names
+            ]
+            if any(np.isfinite(val) for val in metric_values):
+                group_metrics.append((metric_label, metric_values))
+        if group_metrics:
+            prepared_groups.append((group_label, group_metrics))
+
+    if not prepared_groups:
+        return
+
+    positions: List[float] = []
+    labels: List[str] = []
+    values_by_run: Dict[str, List[float]] = {name: [] for name in run_names}
+    group_centers: List[Tuple[str, float]] = []
+    separators: List[float] = []
+
+    current = 0.0
+    for idx, (group_label, metrics) in enumerate(prepared_groups):
+        start = current
+        for metric_label, metric_values in metrics:
+            positions.append(current)
+            labels.append(metric_label)
+            for name, value in zip(run_names, metric_values):
+                values_by_run[name].append(value)
+            current += 1.0
+        center = (start + (current - 1.0)) / 2.0
+        group_centers.append((group_label, center))
+        if idx < len(prepared_groups) - 1:
+            separators.append(current - 0.5)
+        current += 0.6
+
+    x = np.array(positions)
+    num_runs = len(run_names)
+    width = min(0.18, 0.8 / max(num_runs, 1))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    all_values: List[float] = []
+    baseline_values = values_by_run[run_names[0]]
+    bar_records: List[Tuple[Iterable[plt.Rectangle], List[float]]] = []
+
+    for idx, name in enumerate(run_names):
+        values = values_by_run[name]
+        heights = [val if np.isfinite(val) else 0.0 for val in values]
+        offsets = (idx - (num_runs - 1) / 2.0) * width
+        bars = ax.bar(
+            x + offsets,
+            heights,
+            width,
+            color=colors[name],
+            label=name,
+        )
+        bar_records.append((bars, values))
+        all_values.extend([val for val in values if np.isfinite(val)])
+
+    if unit == "percent":
+        configure_percent_axis(ax, all_values)
+    else:
+        configure_value_axis(ax, all_values, ylabel or title)
+
+    for idx, (bars, values) in enumerate(bar_records):
+        labels_for_bars = build_bar_labels(values, baseline_values, unit)
+        annotate_bars(ax, bars, labels_for_bars)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=rotation, ha="right")
+    ax.set_title(title, fontweight="bold")
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.legend()
 
-    annotate_bars(ax, bars_baseline, unit)
-    annotate_bars(ax, bars_ace, unit)
+    for sep in separators:
+        ax.axvline(sep, color="gray", linestyle=":", linewidth=1, alpha=0.6)
 
-    ylim_upper = ax.get_ylim()[1]
-    for idx, (base_val, ace_val) in enumerate(zip(baseline_vals, ace_vals)):
-        if np.isfinite(base_val) and np.isfinite(ace_val):
-            delta = ace_val - base_val
-            ax.text(
-                x[idx],
-                ylim_upper * 0.9,
-                delta_label(delta, unit),
-                ha="center",
-                va="top",
-                fontsize=9,
-                rotation=90,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8),
-            )
+    for group_label, center in group_centers:
+        ax.text(
+            center,
+            -0.15,
+            group_label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=11,
+            fontweight="semibold",
+        )
+
+    fig.subplots_adjust(bottom=0.28)
+    fig.savefig(OUTPUT_DIR / filename, dpi=300)
+    plt.close(fig)
 
 
-def plot_summary_panels(baseline: pd.Series, ace: pd.Series) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+def plot_summary_panels(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
     panels = [
-        ("Composite Accuracy (No Web Search)", "Composite Acc (No Web)", "percent"),
-        ("Non-Live Accuracy", "Non-Live AST Acc", "percent"),
-        ("Live Accuracy", "Live Acc", "percent"),
-        ("Multi-Turn Accuracy", "Multi Turn Acc", "percent"),
+        ("overall", "Composite Acc (No Web)", "Composite Accuracy (No Web)", "percent"),
+        ("overall", "Non-Live AST Acc", "Non-Live Accuracy", "percent"),
+        ("overall", "Live Acc", "Live Accuracy", "percent"),
+        ("overall", "Multi Turn Acc", "Multi-Turn Accuracy", "percent"),
     ]
-    for ax, args in zip(axes.flatten(), panels):
-        plot_single_metric(ax, *args, baseline, ace)
+    for ax, (dataset, column, title, unit) in zip(axes.flatten(), panels):
+        plot_metric_panel(ax, run_data, dataset, column, title, unit, colors)
 
-    fig.suptitle("Macro Performance Comparison (Baseline vs ACE)", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(run_data), fontsize=10)
+    fig.suptitle("BFCL Macro Performance Comparison", fontsize=16, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(OUTPUT_DIR / "summary_performance.png", dpi=300)
     plt.close(fig)
 
 
-def plot_latency_and_cost(baseline: pd.Series, ace: pd.Series) -> None:
+def plot_operational_metrics(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     panels = [
-        ("Total Cost ($)", "Total Cost ($)", "dollars"),
-        ("Latency Mean (s)", "Latency Mean (s)", "Seconds"),
-        ("Latency 95th Percentile (s)", "Latency 95th Percentile (s)", "Seconds"),
+        ("overall", "Total Cost ($)", "Total Cost ($)", "value"),
+        ("overall", "Latency Mean (s)", "Latency Mean (s)", "value"),
+        ("overall", "Latency 95th Percentile (s)", "Latency P95 (s)", "value"),
     ]
-    for ax, (label, column, unit_label) in zip(axes, panels):
-        plot_single_metric(ax, label, column, "value", baseline, ace)
-        ax.set_ylabel(unit_label)
-    fig.suptitle("Operational Metrics (Baseline vs ACE)", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    for ax, (dataset, column, title, unit) in zip(axes, panels):
+        plot_metric_panel(ax, run_data, dataset, column, title, unit, colors)
+        ax.set_ylabel(title)
+    fig.suptitle("Operational Metrics (Lower Is Better)", fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(OUTPUT_DIR / "operational_metrics.png", dpi=300)
     plt.close(fig)
 
 
-def plot_non_live_breakdown(baseline: pd.Series, ace: pd.Series) -> None:
-    metrics = [
-        ("Overall Accuracy", "Non-Live Overall Acc", "percent"),
-        ("AST Summary", "AST Summary", "percent"),
-        ("Simple AST", "Simple AST", "percent"),
-        ("Python Simple AST", "Python Simple AST", "percent"),
-        ("Java Simple AST", "Java Simple AST", "percent"),
-        ("JavaScript Simple AST", "JavaScript Simple AST", "percent"),
-        ("Multiple AST", "Multiple AST", "percent"),
-        ("Parallel AST", "Parallel AST", "percent"),
-        ("Parallel Multiple AST", "Parallel Multiple AST", "percent"),
-        ("Irrelevance Detection", "Irrelevance Detection", "percent"),
+def plot_non_live_breakdown(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    grouped_metrics = [
+        (
+            "Non-Live",
+            "non_live",
+            [
+                ("Overall Accuracy", "Non-Live Overall Acc"),
+                ("AST Summary", "AST Summary"),
+                ("Simple AST", "Simple AST"),
+                ("Python Simple AST", "Python Simple AST"),
+                ("Java Simple AST", "Java Simple AST"),
+                ("JavaScript Simple AST", "JavaScript Simple AST"),
+                ("Multiple AST", "Multiple AST"),
+                ("Parallel AST", "Parallel AST"),
+                ("Parallel Multiple AST", "Parallel Multiple AST"),
+                ("Irrelevance Detection", "Irrelevance Detection"),
+            ],
+        ),
     ]
-    fig, ax = plt.subplots(figsize=(16, 6))
-    plot_grouped_metrics(
-        ax,
-        metrics,
-        baseline,
-        ace,
+    render_metric_groups(
+        "non_live_breakdown.png",
         "Non-Live Task Breakdown (Accuracy %)",
+        grouped_metrics,
+        run_data,
+        colors,
     )
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "non_live_breakdown.png", dpi=300)
-    plt.close(fig)
 
 
-def plot_live_breakdown(baseline: pd.Series, ace: pd.Series) -> None:
-    metrics = [
-        ("Overall Accuracy", "Live Overall Acc", "percent"),
-        ("AST Summary", "AST Summary", "percent"),
-        ("Python Simple AST", "Python Simple AST", "percent"),
-        ("Python Multiple AST", "Python Multiple AST", "percent"),
-        ("Python Parallel AST", "Python Parallel AST", "percent"),
-        ("Python Parallel Multiple AST", "Python Parallel Multiple AST", "percent"),
-        ("Irrelevance Detection", "Irrelevance Detection", "percent"),
-        ("Relevance Detection", "Relevance Detection", "percent"),
+def plot_live_breakdown(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    grouped_metrics = [
+        (
+            "Live",
+            "live",
+            [
+                ("Overall Accuracy", "Live Overall Acc"),
+                ("AST Summary", "AST Summary"),
+                ("Python Simple AST", "Python Simple AST"),
+                ("Python Multiple AST", "Python Multiple AST"),
+                ("Python Parallel AST", "Python Parallel AST"),
+                ("Python Parallel Multiple AST", "Python Parallel Multiple AST"),
+                ("Irrelevance Detection", "Irrelevance Detection"),
+                ("Relevance Detection", "Relevance Detection"),
+            ],
+        ),
     ]
-    fig, ax = plt.subplots(figsize=(16, 6))
-    plot_grouped_metrics(
-        ax,
-        metrics,
-        baseline,
-        ace,
+    render_metric_groups(
+        "live_breakdown.png",
         "Live Task Breakdown (Accuracy %)",
+        grouped_metrics,
+        run_data,
+        colors,
     )
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "live_breakdown.png", dpi=300)
-    plt.close(fig)
 
 
-def plot_multi_turn_breakdown(baseline: pd.Series, ace: pd.Series) -> None:
-    metrics = [
-        ("Overall Accuracy", "Multi Turn Overall Acc", "percent"),
-        ("Base Tasks", "Base", "percent"),
-        ("Missing Function", "Miss Func", "percent"),
-        ("Missing Param", "Miss Param", "percent"),
-        ("Long Context", "Long Context", "percent"),
+def plot_multi_turn_breakdown(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    grouped_metrics = [
+        (
+            "Multi-Turn",
+            "multi",
+            [
+                ("Overall Accuracy", "Multi Turn Overall Acc"),
+                ("Base Tasks", "Base"),
+                ("Missing Function", "Miss Func"),
+                ("Missing Param", "Miss Param"),
+                ("Long Context", "Long Context"),
+            ],
+        ),
     ]
-    fig, ax = plt.subplots(figsize=(12, 5))
-    plot_grouped_metrics(
-        ax,
-        metrics,
-        baseline,
-        ace,
+    render_metric_groups(
+        "multi_turn_breakdown.png",
         "Multi-Turn Task Breakdown (Accuracy %)",
+        grouped_metrics,
+        run_data,
+        colors,
+        figsize=(13, 5),
     )
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "multi_turn_breakdown.png", dpi=300)
-    plt.close(fig)
 
 
 def plot_detection_overview(
-    overall_baseline: pd.Series,
-    overall_ace: pd.Series,
-    live_baseline: pd.Series,
-    live_ace: pd.Series,
-    non_live_baseline: pd.Series,
-    non_live_ace: pd.Series,
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
 ) -> None:
-    metrics = [
-        ("Overall Relevance Detection", overall_baseline["Relevance Detection"], overall_ace["Relevance Detection"]),
-        ("Overall Irrelevance Detection", overall_baseline["Irrelevance Detection"], overall_ace["Irrelevance Detection"]),
-        ("Live Relevance Detection", live_baseline["Relevance Detection"], live_ace["Relevance Detection"]),
-        ("Live Irrelevance Detection", live_baseline["Irrelevance Detection"], live_ace["Irrelevance Detection"]),
-        ("Non-Live Irrelevance Detection", non_live_baseline["Irrelevance Detection"], non_live_ace["Irrelevance Detection"]),
-    ]
-
-    labels = []
-    baseline_vals = []
-    ace_vals = []
-    for label, base_val, ace_val in metrics:
-        if (not np.isfinite(base_val)) and (not np.isfinite(ace_val)):
-            continue
-        labels.append(label)
-        baseline_vals.append(base_val)
-        ace_vals.append(ace_val)
-
-    if not labels:
-        return
-
-    x = np.arange(len(labels))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(14, 6))
-    bars_baseline = ax.bar(
-        x - width / 2,
-        baseline_vals,
-        width,
-        label="Baseline",
-        color=BASELINE_COLOR,
-    )
-    bars_ace = ax.bar(
-        x + width / 2,
-        ace_vals,
-        width,
-        label="ACE",
-        color=ACE_COLOR,
-    )
-
-    configure_percent_axis(ax, baseline_vals + ace_vals)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.set_title("Relevance vs Irrelevance Detection (Accuracy %)", fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend()
-
-    annotate_bars(ax, bars_baseline, "percent")
-    annotate_bars(ax, bars_ace, "percent")
-
-    ylim_upper = ax.get_ylim()[1]
-    for idx, (base_val, ace_val) in enumerate(zip(baseline_vals, ace_vals)):
-        if np.isfinite(base_val) and np.isfinite(ace_val):
-            delta = ace_val - base_val
-            ax.text(
-                x[idx],
-                ylim_upper * 0.88,
-                delta_label(delta, "percent"),
-                ha="center",
-                va="top",
-                fontsize=9,
-                rotation=90,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8),
-            )
-
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "detection_overview.png", dpi=300)
-    plt.close(fig)
-
-
-def build_summary_table(
-    overall_baseline: pd.Series,
-    overall_ace: pd.Series,
-    live_baseline: pd.Series,
-    live_ace: pd.Series,
-    non_live_baseline: pd.Series,
-    non_live_ace: pd.Series,
-    multi_baseline: pd.Series,
-    multi_ace: pd.Series,
-) -> None:
-    rows = [
-        ("Composite Accuracy (No Web Search) (%)", overall_baseline["Composite Acc (No Web)"], overall_ace["Composite Acc (No Web)"]),
-        ("Non-Live Accuracy (%)", overall_baseline["Non-Live AST Acc"], overall_ace["Non-Live AST Acc"]),
-        ("Live Accuracy (%)", overall_baseline["Live Acc"], overall_ace["Live Acc"]),
-        ("Multi-Turn Accuracy (%)", overall_baseline["Multi Turn Acc"], overall_ace["Multi Turn Acc"]),
-        ("Total Cost ($)", overall_baseline["Total Cost ($)"], overall_ace["Total Cost ($)"]),
-        ("Latency Mean (s)", overall_baseline["Latency Mean (s)"], overall_ace["Latency Mean (s)"]),
-        ("Latency P95 (s)", overall_baseline["Latency 95th Percentile (s)"], overall_ace["Latency 95th Percentile (s)"]),
-        ("Non-Live Irrelevance Detection (%)", non_live_baseline["Irrelevance Detection"], non_live_ace["Irrelevance Detection"]),
-        ("Live Relevance Detection (%)", live_baseline["Relevance Detection"], live_ace["Relevance Detection"]),
-        ("Multi-Turn Base (%)", multi_baseline["Base"], multi_ace["Base"]),
-    ]
-
-    table_data = []
-    for metric, base_val, ace_val in rows:
-        if not (np.isfinite(base_val) or np.isfinite(ace_val)):
-            continue
-        is_percent = metric.endswith("(%)")
-        unit = "percent" if is_percent else "value"
-        delta = ace_val - base_val if (np.isfinite(base_val) and np.isfinite(ace_val)) else np.nan
-        table_data.append(
+    grouped_metrics = [
+        (
+            "Overall",
+            "overall",
             [
-                metric,
-                format_value(base_val, "percent" if is_percent else "value"),
-                format_value(ace_val, "percent" if is_percent else "value"),
-                delta_label(delta, "percent" if is_percent else "value").replace("ACE − Baseline: ", "") if np.isfinite(delta) else "N/A",
-            ]
-        )
+                ("Relevance Detection", "Relevance Detection"),
+                ("Irrelevance Detection", "Irrelevance Detection"),
+            ],
+        ),
+        (
+            "Live",
+            "live",
+            [
+                ("Relevance Detection", "Relevance Detection"),
+                ("Irrelevance Detection", "Irrelevance Detection"),
+            ],
+        ),
+        (
+            "Non-Live",
+            "non_live",
+            [
+                ("Irrelevance Detection", "Irrelevance Detection"),
+            ],
+        ),
+    ]
+    render_metric_groups(
+        "detection_overview.png",
+        "Relevance vs Irrelevance Detection (Accuracy %)",
+        grouped_metrics,
+        run_data,
+        colors,
+    )
 
-    if not table_data:
+
+def plot_composite_breakdown(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    grouped_metrics = [
+        (
+            "Composite",
+            "overall",
+            [
+                ("Composite Accuracy", "Composite Acc (No Web)"),
+            ],
+        ),
+        (
+            "Non-Live",
+            "non_live",
+            [
+                ("Overall", "Non-Live Overall Acc"),
+                ("AST Summary", "AST Summary"),
+                ("Simple AST", "Simple AST"),
+                ("Python Simple AST", "Python Simple AST"),
+                ("Java Simple AST", "Java Simple AST"),
+                ("JavaScript Simple AST", "JavaScript Simple AST"),
+                ("Multiple AST", "Multiple AST"),
+                ("Parallel AST", "Parallel AST"),
+                ("Parallel Multiple AST", "Parallel Multiple AST"),
+                ("Irrelevance Detection", "Irrelevance Detection"),
+            ],
+        ),
+        (
+            "Live",
+            "live",
+            [
+                ("Overall", "Live Overall Acc"),
+                ("AST Summary", "AST Summary"),
+                ("Python Simple AST", "Python Simple AST"),
+                ("Python Multiple AST", "Python Multiple AST"),
+                ("Python Parallel AST", "Python Parallel AST"),
+                ("Python Parallel Multiple AST", "Python Parallel Multiple AST"),
+                ("Irrelevance Detection", "Irrelevance Detection"),
+                ("Relevance Detection", "Relevance Detection"),
+            ],
+        ),
+        (
+            "Multi-Turn",
+            "multi",
+            [
+                ("Overall", "Multi Turn Overall Acc"),
+                ("Base Tasks", "Base"),
+                ("Missing Function", "Miss Func"),
+                ("Missing Param", "Miss Param"),
+                ("Long Context", "Long Context"),
+            ],
+        ),
+    ]
+    render_metric_groups(
+        "bfcl_composite_breakdown.png",
+        "BFCL Composite Breakdown (Accuracy %)",
+        grouped_metrics,
+        run_data,
+        colors,
+        rotation=35,
+        figsize=(20, 8),
+    )
+
+
+def plot_grouped_composite_view(
+    run_data: Mapping[str, Dict[str, pd.Series]],
+    colors: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    grouped_metrics = [
+        ("Composite", "overall", [("Composite Accuracy", "Composite Acc (No Web)")]),
+        ("Non-Live Single-Turn", "non_live", [("Non-Live Accuracy", "Non-Live Overall Acc")]),
+        ("Live Single-Turn", "live", [("Live Accuracy", "Live Overall Acc")]),
+        ("Multi-Turn", "multi", [("Multi-Turn Accuracy", "Multi Turn Overall Acc")]),
+        ("Relevance", "overall", [("Relevance Detection", "Relevance Detection")]),
+        ("Irrelevance", "overall", [("Irrelevance Detection", "Irrelevance Detection")]),
+    ]
+    render_metric_groups(
+        "bfcl_grouped_overview.png",
+        "BFCL Core Groupings (Accuracy %)",
+        grouped_metrics,
+        run_data,
+        colors,
+        figsize=(14, 6),
+    )
+
+
+def build_summary_table(run_data: Mapping[str, Dict[str, pd.Series]]) -> None:
+    run_names = list(run_data.keys())
+    metrics = [
+        ("Composite Accuracy (No Web) (%)", "overall", "Composite Acc (No Web)", "percent"),
+        ("Non-Live Accuracy (%)", "overall", "Non-Live AST Acc", "percent"),
+        ("Live Accuracy (%)", "overall", "Live Acc", "percent"),
+        ("Multi-Turn Accuracy (%)", "overall", "Multi Turn Acc", "percent"),
+        ("Total Cost ($)", "overall", "Total Cost ($)", "value"),
+        ("Latency Mean (s)", "overall", "Latency Mean (s)", "value"),
+        ("Latency P95 (s)", "overall", "Latency 95th Percentile (s)", "value"),
+        ("Non-Live Irrelevance Detection (%)", "non_live", "Irrelevance Detection", "percent"),
+        ("Live Relevance Detection (%)", "live", "Relevance Detection", "percent"),
+        ("Multi-Turn Base Accuracy (%)", "multi", "Base", "percent"),
+    ]
+
+    headers = ["Metric"] + run_names
+    table_rows: List[List[str]] = []
+
+    for metric_label, dataset_key, column, unit in metrics:
+        row = [metric_label]
+        has_value = False
+        for run_name in run_names:
+            value = run_data[run_name][dataset_key].get(column, np.nan)
+            formatted = format_value(value, unit)
+            if formatted != "N/A":
+                has_value = True
+            row.append(formatted)
+        if has_value:
+            table_rows.append(row)
+
+    if not table_rows:
         return
 
-    fig, ax = plt.subplots(figsize=(14, 4))
+    fig, ax = plt.subplots(figsize=(3 + 2.2 * len(run_names), 4))
     ax.axis("off")
     table = ax.table(
-        cellText=table_data,
-        colLabels=["Metric", "Baseline", "ACE", "ACE − Baseline"],
+        cellText=table_rows,
+        colLabels=headers,
         cellLoc="center",
         colLoc="center",
         loc="upper center",
     )
     table.auto_set_font_size(False)
     table.set_fontsize(10)
-    table.scale(1, 1.4)
+    table.scale(1, 1.3)
     fig.suptitle("Key Metrics Summary Table", fontsize=14, fontweight="bold")
     fig.tight_layout()
     fig.savefig(OUTPUT_DIR / "summary_table.png", dpi=300)
     plt.close(fig)
 
 
-def plot_composite_breakdown(
-    overall_baseline: pd.Series,
-    overall_ace: pd.Series,
-    non_live_baseline: pd.Series,
-    non_live_ace: pd.Series,
-    live_baseline: pd.Series,
-    live_ace: pd.Series,
-    multi_baseline: pd.Series,
-    multi_ace: pd.Series,
-) -> None:
-    def add_entry(
-        entries: List[Tuple[str, str, float, float]],
-        group: str,
-        label: str,
-        baseline_val,
-        ace_val,
-    ) -> None:
-        if not (np.isfinite(baseline_val) or np.isfinite(ace_val)):
-            return
-        entries.append((group, label, float(baseline_val), float(ace_val)))
-
-    entries: List[Tuple[str, str, float, float]] = []
-
-    add_entry(
-        entries,
-        "Composite Total",
-        "Composite Accuracy",
-        overall_baseline["Composite Acc (No Web)"],
-        overall_ace["Composite Acc (No Web)"],
-    )
-
-    # Non-Live group
-    for label, column in [
-        ("Overall", "Non-Live Overall Acc"),
-        ("AST Summary", "AST Summary"),
-        ("Simple AST", "Simple AST"),
-        ("Python Simple AST", "Python Simple AST"),
-        ("Java Simple AST", "Java Simple AST"),
-        ("JavaScript Simple AST", "JavaScript Simple AST"),
-        ("Multiple AST", "Multiple AST"),
-        ("Parallel AST", "Parallel AST"),
-        ("Parallel Multiple AST", "Parallel Multiple AST"),
-        ("Irrelevance Detection", "Irrelevance Detection"),
-    ]:
-        add_entry(
-            entries,
-            "Non-Live",
-            label,
-            non_live_baseline.get(column, np.nan),
-            non_live_ace.get(column, np.nan),
-        )
-
-    # Live group
-    for label, column in [
-        ("Overall", "Live Overall Acc"),
-        ("AST Summary", "AST Summary"),
-        ("Simple AST", "Python Simple AST"),
-        ("Multiple AST", "Python Multiple AST"),
-        ("Parallel AST", "Python Parallel AST"),
-        ("Parallel Multiple AST", "Python Parallel Multiple AST"),
-        ("Irrelevance Detection", "Irrelevance Detection"),
-        ("Relevance Detection", "Relevance Detection"),
-    ]:
-        add_entry(
-            entries,
-            "Live",
-            label,
-            live_baseline.get(column, np.nan),
-            live_ace.get(column, np.nan),
-        )
-
-    # Multi-Turn group
-    for label, column in [
-        ("Overall", "Multi Turn Overall Acc"),
-        ("Base Tasks", "Base"),
-        ("Missing Function", "Miss Func"),
-        ("Missing Param", "Miss Param"),
-        ("Long Context", "Long Context"),
-    ]:
-        add_entry(
-            entries,
-            "Multi-Turn",
-            label,
-            multi_baseline.get(column, np.nan),
-            multi_ace.get(column, np.nan),
-        )
-
-    if not entries:
-        return
-
-    groups_order: List[str] = []
-    grouped_entries: Dict[str, List[Tuple[str, str, float, float]]] = {}
-    for group, label, baseline_val, ace_val in entries:
-        groups_order.append(group) if group not in groups_order else None
-        grouped_entries.setdefault(group, []).append((group, label, baseline_val, ace_val))
-
-    x_positions: List[float] = []
-    labels: List[str] = []
-    baseline_vals: List[float] = []
-    ace_vals: List[float] = []
-    group_centers: List[Tuple[str, float]] = []
-    separators: List[float] = []
-
-    current = 0.0
-    for idx, group in enumerate(groups_order):
-        items = grouped_entries[group]
-        start = current
-        for _, label, baseline_val, ace_val in items:
-            x_positions.append(current)
-            labels.append(label)
-            baseline_vals.append(baseline_val)
-            ace_vals.append(ace_val)
-            current += 1.0
-        center = (start + (current - 1.0)) / 2.0 if items else start
-        group_centers.append((group, center))
-        if idx < len(groups_order) - 1:
-            separators.append(current - 0.5)
-        current += 0.6  # gap between groups
-
-    x_positions_np = np.array(x_positions)
-    width = 0.35
-
-    fig, ax = plt.subplots(figsize=(18, 8))
-    bars_baseline = ax.bar(
-        x_positions_np - width / 2,
-        baseline_vals,
-        width,
-        color=BASELINE_COLOR,
-        label="Baseline",
-    )
-    bars_ace = ax.bar(
-        x_positions_np + width / 2,
-        ace_vals,
-        width,
-        color=ACE_COLOR,
-        label="ACE",
-    )
-
-    configure_percent_axis(ax, baseline_vals + ace_vals)
-    ax.set_xticks(x_positions_np)
-    ax.set_xticklabels(labels, rotation=35, ha="right")
-    ax.set_title("BFCL Composite Breakdown (Baseline vs ACE)", fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend()
-
-    annotate_bars(ax, bars_baseline, "percent")
-    annotate_bars(ax, bars_ace, "percent")
-
-    for sep in separators:
-        ax.axvline(sep, color="gray", linestyle=":", linewidth=1, alpha=0.6)
-
-    for group, center in group_centers:
-        ax.text(
-            center,
-            -0.12,
-            group,
-            transform=ax.get_xaxis_transform(),
-            ha="center",
-            va="top",
-            fontsize=12,
-            fontweight="semibold",
-        )
-
-    fig.subplots_adjust(bottom=0.28)
-    fig.savefig(OUTPUT_DIR / "bfcl_composite_breakdown.png", dpi=300)
-    plt.close(fig)
-
-
-def average_metrics(series: pd.Series, columns: Sequence[str]) -> float:
-    values = [normalize_value(series.get(col, np.nan)) for col in columns]
-    numeric = [float(val) for val in values if np.isfinite(val)]
-    if not numeric:
-        return np.nan
-    return float(np.mean(numeric))
-
-
-def plot_grouped_composite_view(
-    overall_baseline: pd.Series,
-    overall_ace: pd.Series,
-    non_live_baseline: pd.Series,
-    non_live_ace: pd.Series,
-    live_baseline: pd.Series,
-    live_ace: pd.Series,
-    multi_baseline: pd.Series,
-    multi_ace: pd.Series,
-) -> None:
-    categories = [
-        (
-            "Composite Accuracy",
-            overall_baseline,
-            overall_ace,
-            lambda series: series["Composite Acc (No Web)"],
-        ),
-        (
-            "Non-Live Single-Turn",
-            non_live_baseline,
-            non_live_ace,
-            lambda series: series["Non-Live Overall Acc"],
-        ),
-        (
-            "Live Single-Turn",
-            live_baseline,
-            live_ace,
-            lambda series: series["Live Overall Acc"],
-        ),
-        (
-            "Multi-Turn",
-            multi_baseline,
-            multi_ace,
-            lambda series: series["Multi Turn Overall Acc"],
-        ),
-        (
-            "Relevance Detection",
-            overall_baseline,
-            overall_ace,
-            lambda series: series["Relevance Detection"],
-        ),
-        (
-            "Irrelevance Detection",
-            overall_baseline,
-            overall_ace,
-            lambda series: series["Irrelevance Detection"],
-        ),
-    ]
-
-    rows = []
-    for label, baseline_series, ace_series, extractor in categories:
-        baseline_val = normalize_value(extractor(baseline_series))
-        ace_val = normalize_value(extractor(ace_series))
-        if np.isfinite(baseline_val) or np.isfinite(ace_val):
-            rows.append((label, float(baseline_val), float(ace_val)))
-
-    if not rows:
-        return
-
-    labels = [label for label, _, _ in rows]
-    baseline_vals = [val for _, val, _ in rows]
-    ace_vals = [val for _, _, val in rows]
-
-    x = np.arange(len(labels))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars_baseline = ax.bar(
-        x - width / 2,
-        baseline_vals,
-        width,
-        label="Baseline",
-        color=BASELINE_COLOR,
-    )
-    bars_ace = ax.bar(
-        x + width / 2,
-        ace_vals,
-        width,
-        label="ACE",
-        color=ACE_COLOR,
-    )
-
-    configure_percent_axis(ax, baseline_vals + ace_vals)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.set_title("BFCL Core Groupings (Baseline vs ACE)", fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend()
-
-    annotate_bars(ax, bars_baseline, "percent")
-    annotate_bars(ax, bars_ace, "percent")
-
-    ylim_upper = ax.get_ylim()[1]
-    for idx, (base_val, ace_val) in enumerate(zip(baseline_vals, ace_vals)):
-        if np.isfinite(base_val) and np.isfinite(ace_val):
-            delta = ace_val - base_val
-            ax.text(
-                x[idx],
-                ylim_upper * 0.9,
-                delta_label(delta, "percent"),
-                ha="center",
-                va="top",
-                fontsize=9,
-                rotation=90,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8),
-            )
-
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "bfcl_grouped_overview.png", dpi=300)
-    plt.close(fig)
-
-
 def main() -> None:
     ensure_output_dir()
+    run_data = load_run_data()
+    colors = build_palette(list(run_data.keys()))
 
-    overall_baseline = read_single_row_csv(BASELINE_DIR / "data_overall.csv")
-    overall_ace = read_single_row_csv(ACE_DIR / "data_overall.csv")
-    overall_baseline["Composite Acc (No Web)"] = compute_composite_without_web(overall_baseline)
-    overall_ace["Composite Acc (No Web)"] = compute_composite_without_web(overall_ace)
-    non_live_baseline = read_single_row_csv(BASELINE_DIR / "data_non_live.csv")
-    non_live_ace = read_single_row_csv(ACE_DIR / "data_non_live.csv")
-    live_baseline = read_single_row_csv(BASELINE_DIR / "data_live.csv")
-    live_ace = read_single_row_csv(ACE_DIR / "data_live.csv")
-    multi_baseline = read_single_row_csv(BASELINE_DIR / "data_multi_turn.csv")
-    multi_ace = read_single_row_csv(ACE_DIR / "data_multi_turn.csv")
-
-    plot_summary_panels(overall_baseline, overall_ace)
-    plot_latency_and_cost(overall_baseline, overall_ace)
-    plot_non_live_breakdown(non_live_baseline, non_live_ace)
-    plot_live_breakdown(live_baseline, live_ace)
-    plot_multi_turn_breakdown(multi_baseline, multi_ace)
-    plot_detection_overview(
-        overall_baseline,
-        overall_ace,
-        live_baseline,
-        live_ace,
-        non_live_baseline,
-        non_live_ace,
-    )
-    build_summary_table(
-        overall_baseline,
-        overall_ace,
-        live_baseline,
-        live_ace,
-        non_live_baseline,
-        non_live_ace,
-        multi_baseline,
-        multi_ace,
-    )
-    plot_composite_breakdown(
-        overall_baseline,
-        overall_ace,
-        non_live_baseline,
-        non_live_ace,
-        live_baseline,
-        live_ace,
-        multi_baseline,
-        multi_ace,
-    )
-    plot_grouped_composite_view(
-        overall_baseline,
-        overall_ace,
-        non_live_baseline,
-        non_live_ace,
-        live_baseline,
-        live_ace,
-        multi_baseline,
-        multi_ace,
-    )
+    plot_summary_panels(run_data, colors)
+    plot_operational_metrics(run_data, colors)
+    plot_non_live_breakdown(run_data, colors)
+    plot_live_breakdown(run_data, colors)
+    plot_multi_turn_breakdown(run_data, colors)
+    plot_detection_overview(run_data, colors)
+    plot_composite_breakdown(run_data, colors)
+    plot_grouped_composite_view(run_data, colors)
+    build_summary_table(run_data)
 
     print(f"Plots saved under: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
     main()
-
 
