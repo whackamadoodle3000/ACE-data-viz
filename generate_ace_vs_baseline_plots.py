@@ -232,6 +232,8 @@ def render_metric_groups(
     rotation: int = 25,
     figsize: Tuple[float, float] = (16, 6),
     ylabel: str | None = None,
+    annotate: bool = True,
+    show_group_labels: bool = True,
 ) -> None:
     run_names = list(run_data.keys())
     if not run_names:
@@ -301,9 +303,10 @@ def render_metric_groups(
     else:
         configure_value_axis(ax, all_values, ylabel or title)
 
-    for idx, (bars, values) in enumerate(bar_records):
-        labels_for_bars = build_bar_labels(values, baseline_values, unit)
-        annotate_bars(ax, bars, labels_for_bars)
+    if annotate:
+        for idx, (bars, values) in enumerate(bar_records):
+            labels_for_bars = build_bar_labels(values, baseline_values, unit)
+            annotate_bars(ax, bars, labels_for_bars)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=rotation, ha="right")
@@ -311,22 +314,24 @@ def render_metric_groups(
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.legend()
 
-    for sep in separators:
-        ax.axvline(sep, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+    if show_group_labels:
+        for sep in separators:
+            ax.axvline(sep, color="gray", linestyle=":", linewidth=1, alpha=0.6)
 
-    for group_label, center in group_centers:
-        ax.text(
-            center,
-            -0.15,
-            group_label,
-            transform=ax.get_xaxis_transform(),
-            ha="center",
-            va="top",
-            fontsize=11,
-            fontweight="semibold",
-        )
+        for group_label, center in group_centers:
+            ax.text(
+                center,
+                -0.15,
+                group_label,
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=11,
+                fontweight="semibold",
+            )
 
-    fig.subplots_adjust(bottom=0.28)
+    bottom_margin = 0.28 if show_group_labels else 0.18
+    fig.subplots_adjust(bottom=bottom_margin)
     fig.savefig(OUTPUT_DIR / filename, dpi=300)
     plt.close(fig)
 
@@ -567,12 +572,12 @@ def plot_grouped_composite_view(
     colors: Mapping[str, Tuple[float, float, float, float]],
 ) -> None:
     grouped_metrics = [
-        ("Composite", "overall", [("Composite Accuracy", "Composite Acc (No Web)")]),
-        ("Non-Live Single-Turn", "non_live", [("Non-Live Accuracy", "Non-Live Overall Acc")]),
-        ("Live Single-Turn", "live", [("Live Accuracy", "Live Overall Acc")]),
-        ("Multi-Turn", "multi", [("Multi-Turn Accuracy", "Multi Turn Overall Acc")]),
-        ("Relevance", "overall", [("Relevance Detection", "Relevance Detection")]),
-        ("Irrelevance", "overall", [("Irrelevance Detection", "Irrelevance Detection")]),
+        ("Composite", "overall", [("Composite", "Composite Acc (No Web)")]),
+        ("Non-Live Single-Turn", "non_live", [("Non-Live Single-Turn", "Non-Live Overall Acc")]),
+        ("Live Single-Turn", "live", [("Live Single-Turn", "Live Overall Acc")]),
+        ("Multi-Turn", "multi", [("Multi-Turn", "Multi Turn Overall Acc")]),
+        ("Relevance", "overall", [("Relevance", "Relevance Detection")]),
+        ("Irrelevance", "overall", [("Irrelevance", "Irrelevance Detection")]),
     ]
     render_metric_groups(
         "bfcl_grouped_overview.png",
@@ -581,6 +586,9 @@ def plot_grouped_composite_view(
         run_data,
         colors,
         figsize=(14, 6),
+        annotate=False,
+        show_group_labels=False,
+        rotation=15,
     )
 
 
